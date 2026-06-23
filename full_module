@@ -1,0 +1,374 @@
+import os
+import glob
+import json
+import time
+import base64
+import requests
+import traceback
+from pathlib import Path
+from typing import List
+from pydantic import BaseModel, Field
+from openai import OpenAI
+
+# =====================================================================
+# 1. DIRECTORY STRUCTURE & SYSTEM INITIALIZATION
+# =====================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DIR_M1_OUTPUT = os.path.join(BASE_DIR, "modul1_json")
+DIR_M2_OUTPUT = os.path.join(BASE_DIR, "modul2_json")
+DIR_M3_OUTPUT = os.path.join(BASE_DIR, "modul3_json")
+DIR_M4_OUTPUT = os.path.join(BASE_DIR, "modul4_image")
+
+# Ensure all structural system directories exist
+for folder_path in [DIR_M1_OUTPUT, DIR_M2_OUTPUT, DIR_M3_OUTPUT, DIR_M4_OUTPUT]:
+    os.makedirs(folder_path, exist_ok=True)
+
+# System Authentication Configuration
+OPENAI_API_KEY = ""
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =====================================================================
+# 2. DATA SCHEMA REGISTRATION (STRUCTURED DATA LAYER)
+# =====================================================================
+class UserFeatures(BaseModel):
+    gender: str = Field(description="Intended presentation style or gender expression of the outfit")
+    skin_tone: str = Field(description="General color palette context or neutral")
+    hairstyle: str = Field(description="Hair style presentation")
+    body_type_characteristics: str = Field(description="Overall outfit silhouette and fit characteristics")
+
+class CurrentOutfit(BaseModel):
+    style: str
+    color: str
+    material: str
+
+class OutfitAnalysis(BaseModel):
+    advantages: List[str] = Field(description="Must contain exactly 2 advantages")
+    areas_for_improvement: List[str] = Field(description="Must contain exactly 2 areas for improvement")
+
+class Module1Output(BaseModel):
+    user_features: UserFeatures
+    current_outfit: CurrentOutfit
+    analysis: OutfitAnalysis
+    base_image_b64: str = Field(description="Original user profile image encoded in base64 string")
+
+class WardrobeItemTags(BaseModel):
+    category: str = Field(description="Main clothing category, e.g., shirt, pants, jacket")
+    sub_category: str = Field(description="Specific type, e.g., cargo pants, slim-fit chinos")
+    dominant_color: str = Field(description="Primary background color, e.g., dark indigo, warm khaki")
+    secondary_color: str = Field(description="Accent or pattern color if any, otherwise 'none'")
+    color_tone: str = Field(description="Tone classification, e.g., pastel, earth-tone")
+    material_texture: str = Field(description="Estimated fabric material and weave, e.g., cotton twill")
+    fit_type: str = Field(description="Silhouette fit, e.g., relaxed fit, oversized")
+    neckline_or_collar: str = Field(description="Neck or collar style, e.g., crew neck, open collar")
+    sleeve_or_length: str = Field(description="Length type, e.g., short-sleeve, long-sleeve")
+    pattern_or_print: str = Field(description="Surface design, e.g., solid color, stripes")
+    clothing_image_b64: str = Field(description="Original item image encoded in base64 string")
+
+class SelectedWardrobeDetails(BaseModel):
+    id_baju: str = Field(description="The matching id_baju chosen from the inventory, e.g., 'baju_images_1'")
+    item_description: str = Field(description="Clean, granular fashion description of the item based on Module 2 tags.")
+
+class Module3StandardOutput(BaseModel):
+    category: str = Field(description="The matching fashion category style name, e.g., 'Smart Business Formal'")
+    selected_items: List[SelectedWardrobeDetails] = Field(description="List of specific wardrobe items chosen by the AI with their IDs and granular descriptions.")    
+    styling_advice: str = Field(description="A paragraph under 100 words explaining why this specific combination flatters their body shape shortcomings.")
+    image_generation_prompt: str = Field(description="High-definition prompt for image generation in English.")
+
+class WebCatalogDetails(BaseModel):
+    selected_clothes: List[str] = Field(description="List of selected clothes from web stores like Uniqlo or H&M.")
+    explanation: str = Field(description="A paragraph under 100 words explaining why this new outfit can flatter their shortcomings.")
+
+class Module3WebCatalogOutput(BaseModel):
+    category: str = Field(description="The matching fashion category style name, e.g., 'Casual'")
+    styling_advice: WebCatalogDetails = Field(description="Structured object containing selected clothes array and text explanation.")
+    image_generation_prompt: str = Field(description="High-definition prompt for image generation in English.")
+
+# =====================================================================
+# 3. UTILITY & CONVERSION HELPER LAYER
+# =====================================================================
+def get_images_by_pattern(prefix_pattern: str) -> List[str]:
+    valid_extensions = ['jpg', 'jpeg', 'png', 'webp', 'JPG', 'PNG', 'JPEG']
+    matched_files = []
+    for ext in valid_extensions:
+        search_pattern = os.path.join(BASE_DIR, f"{prefix_pattern}*.{ext}")
+        matched_files.extend(glob.glob(search_pattern))
+    return sorted(list(set(matched_files)))
+
+def encode_image_to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode('utf-8')
+
+# =====================================================================
+# 4. CORE PIPELINE CORE ENGINES
+# =====================================================================
+def run_module_1_vision_analysis(image_path: str) -> Module1Output:
+    print("\n--- Running Module 1: OpenAI Vision Analysis Agent ---")
+    base64_image = encode_image_to_base64(image_path)
+    
+    vision_prompt = """
+    You are an expert fashion consultant and computer vision analyzer. 
+    Analyze the person in the uploaded photo with high precision. 
+    Identify their structural body shape, skin tone palette, hairstyle presentation, and the precise design details of their current outfit.
+
+    🚫 NEGATIVE PROMPT & SYSTEM GUARDRAILS:
+    1. DO NOT include background objects, room furniture, shadows, or photo quality in the analysis.
+    2. NO BIAS OR HALLUCINATION: Maintain strict consistency with the visible gender presentation and body proportions.
+    """
+    
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = openai_client.beta.chat.completions.parse(
+                model="gpt-5.5",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                response_format=Module1Output
+            )
+            parsed_output = completion.choices[0].message.parsed
+            parsed_output.base_image_b64 = base64_image
+            return parsed_output
+        except Exception as e:
+            if attempt < max_retries: time.sleep(2)
+            else: raise e
+
+def run_module_2_wardrobe_tagging(image_path: str) -> WardrobeItemTags:
+    print(f"-> Running Module 2: Tagging Agent scanning clothing item...")
+    base64_image = encode_image_to_base64(image_path)
+
+    tagging_prompt = """
+    You are an advanced multi-modal fashion analysis engine. 
+    Analyze the uploaded single clothing item image in extreme, granular detail.
+    """
+    
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = openai_client.beta.chat.completions.parse(
+                model="gpt-5.5",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": tagging_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                response_format=WardrobeItemTags,
+                temperature=1
+            )
+            parsed_tags = completion.choices[0].message.parsed
+            parsed_tags.clothing_image_b64 = base64_image
+            return parsed_tags
+        except Exception as e:
+            if attempt < max_retries: time.sleep(2)
+            else: raise e
+
+def run_module_3_stylist_agent_v3(path_m1_json: str, list_wardrobe_data: List[dict], condition_type: str = "3", chosen_style: str = "any"):
+    print(f"\n--- Running Module 3: OpenAI Stylist Agent [CONDITION MODE {condition_type}] ---")
+    
+    with open(path_m1_json, "r", encoding="utf-8") as f:
+        data_m1 = json.load(f)
+
+    user_features_context = json.dumps(data_m1.get('user_features', {}))
+    analysis_context = json.dumps(data_m1.get('analysis', {}))
+
+    # 🛡️ FILTER STRIPPER: Strip huge base64 strings before API inference to reduce token costs up to 90%
+    cleaned_wardrobe_payload = []
+    for item in list_wardrobe_data:
+        item_copy = item.copy()
+        item_copy.pop("clothing_image_b64", None)  # Drops base64 text payload from context window
+        cleaned_wardrobe_payload.append(item_copy)
+
+    if condition_type == "1":
+        response_schema_target = Module3StandardOutput
+        constraint_instruction = f"""
+        Constraints: You MUST ONLY use and assemble the clothing items provided in the 'Selected Wardrobe Inventory Items' list below. 
+        Each item has a unique 'id_baju' field. DO NOT invent or add any entirely new garments.
+        
+        CRITICAL STYLE REQUIREMENT: Orchestrate these items to match the targeted theme: '{chosen_style.upper()}'.
+        """
+        task_instruction = f"""
+        Task 1: For every clothing item selected, create an object inside 'selected_items' with its exact 'id_baju' and clean fashion description.
+        Task 2: Inside 'styling_advice', write an analysis under 100 words explicitly mentioning the chosen 'id_baju' codes.
+        Task 3: Write a high-definition image generation prompt stored in 'image_generation_prompt' matching the '{chosen_style.upper()}' vibe.
+        """
+
+    elif condition_type == "2":
+        response_schema_target = Module3WebCatalogOutput
+        constraint_instruction = f"""
+        Constraints: You MUST ONLY select and recommend clothing items from the 'Available Web Catalog Store' list provided below.
+        These are real items fetched via a high-accuracy automated web crawler from Uniqlo and H&M.
+        DO NOT invent, hallucinate, or introduce any brand new items or clothing models that do not exist in this provided catalog list.
+        
+        CRITICAL STYLE REQUIREMENT: Align the overall selection with the targeted theme: '{chosen_style.upper()}'.
+        """
+        task_instruction = f"""
+        Task 1: Inside 'styling_advice.selected_clothes', create a structured list of strings containing the exact 'brand', 'item_name', and 'dominant_color' of the products you chose from the catalog (e.g., 'Uniqlo: Smart Ankle Pants (Charcoal Black)').
+        Task 2: Inside 'styling_advice.explanation', write a paragraph under 100 words explaining to the user why this specific outfit combination from the store flatters their body shape shortcomings.
+        Task 3: Write a high-definition image generation prompt stored in 'image_generation_prompt'. Combine the user's features with the exact visual attributes of the chosen catalog products.
+        """
+
+    else:
+        response_schema_target = Module3StandardOutput
+        constraint_instruction = f"""
+        Design a fully generative outfit for the user based on physical features matching the '{chosen_style.upper()}' theme.
+        """
+        task_instruction = f"""
+        Task 1: Keep 'selected_items' empty [].
+        Task 2: Inside 'styling_advice', write an analysis under 100 words.
+        Task 3: Write a high-definition image generation prompt stored in 'image_generation_prompt'.
+        """
+
+    context_prompt = f"""
+    You are a top-tier personal fashion stylist director. 
+    
+    [User Profile Context]
+    User Features: {user_features_context}
+    Outfit Analysis & Shortcomings: {analysis_context}
+    
+    [Core Directives & Constraints]
+    {constraint_instruction}
+    
+    [Selected Wardrobe Inventory Items (Only applicable for Condition 1)]
+    { json.dumps(cleaned_wardrobe_payload, indent=2) }
+    
+    [Required Action Tasks]
+    {task_instruction}
+
+    CRITICAL CONSTRAINTS FOR IMAGE PROMPT:
+    - CAMERA COMPOSITION: A full-body shot captured from a medium-long distance. Head to toe fully visible.
+    - BACKGROUND CONSTRAINT: Focus strictly on a SOLID PURE WHITE back-drop, with absolutely NO studio props.
+    """
+    
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = openai_client.beta.chat.completions.parse(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": context_prompt}],
+                response_format=response_schema_target,
+                temperature=1
+            )
+            return completion.choices[0].message.parsed
+        except Exception as e:
+            if attempt < max_retries: time.sleep(2)
+            else: raise e
+    
+def run_module_4_image_generator(input_json_path: str, output_folder: str):
+    print("\n--- Running Module 4: OpenAI Image Generator Agent (gpt-image-2) ---")
+    
+    with open(input_json_path, "r", encoding="utf-8") as f:
+        data_m3 = json.load(f)
+        
+    raw_prompt = data_m3.get("image_generation_prompt")
+    if not raw_prompt:
+        raise ValueError("Missing key 'image_generation_prompt' in source JSON file.") 
+    print(f"[DEBUG] Executing Creative Prompt: {raw_prompt}")
+    save_image_path = os.path.join(output_folder, "recommended_outfit_lookbook.png")
+    
+    try:
+        response = openai_client.images.generate(
+            model="gpt-image-2",
+            prompt=raw_prompt,
+            size="1024x1024",
+            quality="low"
+        )
+        dalle_url = getattr(response.data[0], 'url', None)
+        dalle_b64 = getattr(response.data[0], 'b64_json', None)
+        
+        if dalle_url and dalle_url != "None":
+            print(f"[DEBUG] Remote URL Active. Downloading generated image asset...")
+            img_data = requests.get(dalle_url).content 
+            with open(save_image_path, "wb") as f: f.write(img_data) 
+            print(f"✅ Success! Recommendation lookbook image saved via URL to: {save_image_path}") 
+        elif dalle_b64:
+            print(f"[DEBUG] Base64 String Active. Decoding image binary locally...")
+            img_bytes = base64.b64decode(dalle_b64)
+            with open(save_image_path, "wb") as f: f.write(img_bytes)
+            print(f"✅ Success! Recommendation lookbook image saved via Base64 to: {save_image_path}")
+        else:
+            print("❌ Failure: Server response payload contains no image data paths.")
+    except Exception as err:
+        print(f"❌ Image generation request failed. Details: {err}")
+
+# =====================================================================
+# 5. EXECUTION LAYER & LOCAL SIMULATION BENCHMARK
+# =====================================================================
+if __name__ == "__main__":
+    print("=== STARTING FULL END-TO-END LOCAL TESTING ===")
+    
+    # SYSTEM CONTROLLERS
+    TEST_CONDITION = "1"   # Sceanarios: "1" = Own Wardrobe, "2" = Web Catalog, "3" = Fully Generative
+    TEST_STYLE = "formal"  # Targeted Vibe: e.g., formal, casual, streetwear, vintage
+    
+    # Locates user profile image assets matching 'user*' prefix
+    user_image_list = get_images_by_pattern('user')
+    
+    if user_image_list:
+        file_result_m1 = os.path.join(DIR_M1_OUTPUT, "Model_1_result.json")
+        file_result_m3 = os.path.join(DIR_M3_OUTPUT, "Model_3_result.json")
+        
+        try:
+            # ==== STEP 1: EXECUTE BODY & VISUAL ANALYSIS (MODULE 1) ====
+            m1_out = run_module_1_vision_analysis(user_image_list[0])
+            with open(file_result_m1, "w", encoding="utf-8") as f:
+                f.write(m1_out.model_dump_json(indent=4))
+            print("✅ Success: Module 1 analysis exported.")
+            
+            # ==== STEP 2: LOAD WARDROBE DATA CONFIGURATION (MODULE 2) ====
+            current_wardrobe_inventory = []
+            
+            real_wardrobe_inventory = []
+            
+            if TEST_CONDITION == "1":
+                path_lemari_tunggal = "d:/teep/fasion asisstant/openai/module2_output/koleksi_lemari_baju.json"
+                with open(path_lemari_tunggal, "r", encoding="utf-8") as f:
+                    real_wardrobe_inventory = json.load(f)
+                print(f"🤖 Module 3 parsed {len(real_wardrobe_inventory)} items from unified wardrobe JSON.")
+                
+            elif TEST_CONDITION == "2":
+                # 🎯 JALUR INTEGRASI CRAWLER PROFESOR
+                path_katalog_crawl = os.path.join(FOLDER_UTAMA, "katalog_web_store.json")
+                if not os.path.exists(path_katalog_crawl):
+                    raise FileNotFoundError(f"Missing web crawler database file. Please run crawler_catalog.py first! Target: '{path_katalog_crawl}'")
+                with open(path_katalog_crawl, "r", encoding="utf-8") as f:
+                    real_wardrobe_inventory = json.load(f) # Payload catalog disuapkan ke parameter list_baju_data
+                print(f"🌐 Module 3 successfully injected {len(real_wardrobe_inventory)} crawled catalog items from Uniqlo/H&M.")
+                
+            else:
+                print(f"\n⏩ [BYPASS] Skipping Module 2 ingestion path for Scenario Condition Mode: {TEST_CONDITION}.")
+                real_wardrobe_inventory = []
+            
+            # ==== STEP 3: EXECUTE STYLIST MATRIX MATCHMAKING MATCH (MODULE 3) ====
+            m3_out = run_module_3_stylist_agent_v3(
+                path_m1_json=file_result_m1, 
+                list_wardrobe_data=current_wardrobe_inventory, 
+                condition_type=TEST_CONDITION, 
+                chosen_style=TEST_STYLE
+            )
+            
+            with open(file_result_m3, "w", encoding="utf-8") as f:
+                if hasattr(m3_out, 'model_dump_json'):
+                    f.write(m3_out.model_dump_json(indent=4))
+                else:
+                    f.write(json.dumps(m3_out, indent=4))
+            print(f"✅ Success: Module 3 stylist recommendation model exported (Mode {TEST_CONDITION}).")
+            
+            # ==== STEP 4: GENERATE VISUAL LOOKBOOK PREVIEW (MODULE 4) ====
+            run_module_4_image_generator(file_result_m3, DIR_M4_OUTPUT)
+            print(f"\n🎉 [PIPELINE SUCCESS] End-to-end framework execution for Condition Mode {TEST_CONDITION} completed successfully!")
+            
+        except Exception as err:
+            print("\n❌ Pipeline crashed during local test execution:")
+            traceback.print_exc()
+    else:
+        print("💡 [Instruction] Place a profile image file named 'user.jpg' inside the root folder to initialize.")
