@@ -1,0 +1,198 @@
+import os
+import io
+import json
+import time
+import shutil
+import glob
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from typing import List
+from PIL import Image as PILImage
+import base64
+
+# =====================================================================
+# SINKRONISASI IMPOR: Menggunakan fungsi Agen v3 yang mendukung PPT
+# =====================================================================
+from full_module import (
+    run_module_1_vision_analysis,
+    run_module_2_wardrobe_tagging,
+    run_module_3_stylist_agent_v3,  # <-- Pembaruan ke fungsi multi-kondisi
+    DIR_M1, DIR_M2, DIR_M3, DIR_M4, openai_client
+)
+
+app = FastAPI(title="AI Fashion Assistant API - Wardrobe Inventory Tier")
+
+# Mengizinkan akses CORS lintas platform untuk pengujian browser FlutterFlow Sesi Test
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory=DIR_M4), name="static")
+
+def generate_image_via_openai_mini_b64(prompt: str) -> str:
+    """Mengambil biner gambar dari OpenAI gpt-image-1-mini dan mengompresnya demi menghemat bandwidth HP"""
+    try:
+        print(f"[DEBUG] Mengirim prompt ke OpenAI Image Agent...")
+        response = openai_client.images.generate(
+            model="gpt-image-1-mini",
+            prompt=prompt,
+            size="1024x1024",
+            response_format="b64_json"  # Mengembalikan teks string Base64 langsung
+        )
+        
+        if response and response.data:
+            raw_b64 = getattr(response.data[0], 'b64_json', None)
+            if raw_b64:
+                print("[DEBUG] Mengompresi gambar hasil inferensi ke JPEG 75%...")
+                img_bytes = base64.b64decode(raw_b64)
+                img = PILImage.open(io.BytesIO(img_bytes))
+                
+                # Turunkan resolusi ke ukuran optimal layar HP (512x512) demi performa render
+                img = img.resize((512, 512), PILImage.Resampling.LANCZOS)
+                
+                # Kompresi instan memangkas kapasitas memori file dari ~2MB menjadi cuma ~40KB!
+                buffered = io.BytesIO()
+                img.convert("RGB").save(buffered, format="JPEG", quality=75)
+                
+                compressed_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                print("✅ [SUKSES OPTIMASI CITRA] Ukuran terpangkas! Siap kirim instan.")
+                return compressed_b64
+                
+        print("[OpenAI Error Log] Ekstraksi b64_json gagal.")
+        return ""
+    except Exception as err:
+        print(f"[OpenAI Image Error Log] Gagal memproses gambar: {err}")
+        return ""
+
+# =====================================================================
+# ENDPOINT 1: TAGGING ELEMEN BAJU BARU SEBELUM MASUK FIREBASE
+# =====================================================================
+@app.post("/api/tag-wardrobe-item")
+async def tag_wardrobe_item(clothing_photo: UploadFile = File(...)):
+    """Ditembak oleh FlutterFlow saat user klik 'Simpan ke Lemari Baju' untuk mengisi tag otomatis"""
+    base_dir = Path(__file__).resolve().parent
+    temp_dir = base_dir / "temp_tagging_run"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        nama_file_asli = clothing_photo.filename if clothing_photo.filename else "baju.jpg"
+        ekstensi = Path(nama_file_asli).suffix if Path(nama_file_asli).suffix else ".jpg"
+        w_path = temp_dir / f"input_item{ekstensi}"
+        
+        w_bytes = await clothing_photo.read()
+        with PILImage.open(io.BytesIO(w_bytes)) as w_img:
+            w_img.convert("RGB").save(str(w_path), format="JPEG", quality=90)
+            
+        baju_tags = run_module_2_wardrobe_tagging(str(w_path))
+        return baju_tags.model_dump()
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_dir.exists():
+            try: shutil.rmtree(str(temp_dir))
+            except: pass
+
+# =====================================================================
+# ENDPOINT 2: PIPELINE GENERATE BERBASIS PARSING STRING DATA JSON FIREBASE
+# =====================================================================
+@app.post("/api/process-fashion-v2")
+async def process_fashion_pipeline_v2(
+    user_photo: UploadFile = File(...),
+    selected_wardrobe_json: str = Form(...), 
+    condition: str = Form("3"),              # Menerima pilihan angka: "1" (Lemari), "2" (Katalog Web), "3" (Bebas AI)
+    chosen_style: str = Form("any"),         
+    max_outfits: str = Form("all")
+):
+    """Endpoint utama hemat kuota. Sinkron penuh dengan multi-skema output dari full_module yang baru!"""
+    base_dir = Path(__file__).resolve().parent
+    temp_dir = base_dir / "temp_api_v2_run"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # ==========================================================
+        # 1. ANALISIS FOTO PROFIL USER (MODUL 1)
+        # ==========================================================
+        user_path = temp_dir / "user_profile.jpg"
+        user_bytes = await user_photo.read()
+        with PILImage.open(io.BytesIO(user_bytes)) as img:
+            img.convert("RGB").save(str(user_path), format="JPEG", quality=95)
+            
+        m1_output = run_module_1_vision_analysis(str(user_path))
+        file_result_m1 = os.path.join(DIR_M1, "Model_1_result_v2.json")
+        with open(file_result_m1, "w", encoding="utf-8") as f:
+            f.write(m1_output.model_dump_json(indent=4))
+
+        # ==========================================================
+        # 2. PARSING STRING DATA LEMARI BAJU (HANYA UNTUK KONDISI 1)
+        # ==========================================================
+        selected_wardrobe = []
+        if condition == "1":
+            print(f"▶️ [JALUR UTAMA] Mengekstrak data baju digital dari Firebase untuk Kondisi 1...")
+            wardrobe_inventory_payload = json.loads(selected_wardrobe_json)
+            total_baju = len(wardrobe_inventory_payload)
+            if max_outfits == "all" or not max_outfits.isdigit():
+                jumlah_dipilih = total_baju
+            else:
+                jumlah_dipilih = min(max(1, int(max_outfits)), total_baju)
+            selected_wardrobe = wardrobe_inventory_payload[:jumlah_dipilih]
+        else:
+            print(f"▶️ [BYPASS] Mengaktifkan rute cepat untuk Kondisi {condition}. Pipeline Modul 2 dilewati.")
+
+        # ==========================================================
+        # 3. EKSEKUSI AGEN STRATEGIC STYLIST V3 (MODUL 3 MULTI-KONDISI)
+        # ==========================================================
+        m3_raw_data = run_module_3_stylist_agent_v3(
+            path_model_1_json=file_result_m1,
+            list_baju_data=selected_wardrobe,
+            condition_type=condition,
+            chosen_style=chosen_style
+        )
+
+        # ==========================================================
+        # 4. NORMALISASI KONTRAK DATA UNTUK FLUTTERFLOW (ANTI-EROR 422 🔑)
+        # ==========================================================
+        # Menyatukan bentuk output agar FlutterFlow menerima struktur string yang seragam
+        if condition == "2":
+            # Jika memilih mode katalog web (Kondisi 2), susun list baju menjadi teks poin pembuka
+            items_toko = m3_raw_data.styling_advice.selected_clothes
+            paragraf_penjelas = m3_raw_data.styling_advice.explanation
+            
+            string_daftar_baju = "\n".join([f"• {item}" for item in items_toko])
+            teks_saran_akhir = f"RECOMMENDED CATALOG ITEMS:\n{string_daftar_baju}\n\nSTYLING ANALYSIS:\n{paragraf_penjelas}"
+        else:
+            # Kondisi 1 dan Kondisi 3 langsung mengambil teks string bawaannya
+            teks_saran_akhir = m3_raw_data.styling_advice
+
+        # ==========================================================
+        # 5. GENERATE GAMBAR VISUAL MODEL (MODUL 4)
+        # ==========================================================
+        string_b64_hasil = generate_image_via_openai_mini_b64(m3_raw_data.image_generation_prompt)
+    
+        # ==========================================================
+        # 6. RESPONSE BALIK KE FLUTTERFLOW
+        # ==========================================================
+        return {
+            "category": m3_raw_data.category, 
+            "recommendation": teks_saran_akhir,
+            "result_image_b64": string_b64_hasil
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_dir.exists():
+            try: shutil.rmtree(str(temp_dir))
+            except: pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
